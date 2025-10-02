@@ -1,0 +1,19 @@
+---
+- name: Deploy hello app using kubectl on master
+  hosts: kube_master
+  become: yes
+  tasks:
+    - name: Copy hello manifest to master
+      copy:
+        src: ./hello.yaml
+        dest: /tmp/hello.yaml
+        owner: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: Apply manifest with kubectl
+      shell: KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /tmp/hello.yaml
+      register: apply_output
+
+    - name: Show applied resources
+      debug:
+        var: apply_output.stdout_lines

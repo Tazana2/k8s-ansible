@@ -1,0 +1,67 @@
+---
+- name: Setup Kubernetes cluster
+  hosts: kube_master
+  become: yes
+  tasks:
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        remote_src: yes
+
+    - name: Install Flannel CNI
+      shell: |
+        KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      args:
+        warn: false
+
+    - name: Create join command and save
+      shell: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Save join command to file
+      copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: "{{ join_cmd.stdout }}"
+        mode: '0700'
+
+- name: Join workers to cluster
+  hosts: kube_workers
+  become: yes
+  tasks:
+    - name: Get join command from master (slurp file)
+      slurp:
+        src: /tmp/kube_join_cmd.sh
+      delegate_to: "{{ groups['kube_master'][0] }}"
+      register: slurped_join
+
+    - name: Write join command locally on worker
+      copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: "{{ slurped_join.content | b64decode }}"
+        mode: '0700'
+
+    - name: Join the cluster
+      shell: /tmp/kube_join_cmd.sh
+      args:
+        warn: false
+      register: join_result
+      retries: 3
+      delay: 5
+      until: join_result.rc == 0
+
+- name: Verify cluster nodes (run in master)
+  hosts: kube_master
+  become: yes
+  tasks:
+    - name: Show nodes
+      shell: KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes -o wide
+      register: nodes_output
+
+    - name: Print nodes
+      debug:
+        var: nodes_output.stdout_lines
