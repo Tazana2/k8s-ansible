@@ -1,0 +1,186 @@
+---
+- name: Initialize Kubernetes master node
+  hosts: kube_master
+  become: yes
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig
+
+    - name: Initialize Kubernetes cluster with kubeadm
+      shell: |
+        kubeadm init \
+          --pod-network-cidr=10.244.0.0/16 \
+          --ignore-preflight-errors=all
+      when: not kubeconfig.stat.exists
+      register: kubeadm_init
+
+    - name: Display kubeadm init result
+      debug:
+        var: kubeadm_init.stdout
+      when: not kubeconfig.stat.exists
+
+    - name: Display kubeadm init errors if any
+      debug:
+        var: kubeadm_init.stderr
+      when: not kubeconfig.stat.exists and kubeadm_init.stderr != ""
+
+    - name: Create .kube directory for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+        remote_src: yes
+      when: not kubeconfig.stat.exists
+
+    - name: Set KUBECONFIG environment variable
+      lineinfile:
+        path: /home/ubuntu/.bashrc
+        line: 'export KUBECONFIG=/home/ubuntu/.kube/config'
+        state: present
+
+    - name: Wait for Kubernetes API server to be ready
+      shell: |
+        timeout 300 bash -c 'until kubectl get nodes >/dev/null 2>&1; do echo "Waiting for API server..."; sleep 10; done'
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: wait_api
+      retries: 3
+      delay: 30
+      until: wait_api.rc == 0
+
+    - name: Display API server wait result
+      debug:
+        var: wait_api.stdout
+
+    - name: Install Flannel CNI plugin
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: flannel_install
+      retries: 3
+      delay: 10
+
+    - name: Display Flannel installation result
+      debug:
+        var: flannel_install.stdout
+
+    - name: Display Flannel installation errors
+      debug:
+        var: flannel_install.stderr
+      when: flannel_install.stderr != ""
+
+    - name: Wait for Flannel pods to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=flannel -n kube-system --timeout=300s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: wait_flannel
+      ignore_errors: yes
+
+    - name: Create join command for worker nodes
+      shell: |
+        kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Save join command to file
+      copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: "{{ join_cmd.stdout }}"
+        mode: '0700'
+
+    - name: Display join command
+      debug:
+        msg: "Join command: {{ join_cmd.stdout }}"
+
+- name: Join worker nodes to cluster
+  hosts: kube_workers
+  become: yes
+  tasks:
+    - name: Check if node is already joined
+      shell: |
+        test -f /etc/kubernetes/kubelet.conf && echo "joined" || echo "not_joined"
+      register: node_status
+      changed_when: false
+
+    - name: Get join command from master
+      slurp:
+        src: /tmp/kube_join_cmd.sh
+      delegate_to: "{{ groups['kube_master'][0] }}"
+      register: slurped_join
+      when: "'not_joined' in node_status.stdout"
+
+    - name: Write join command locally on worker
+      copy:
+        dest: /tmp/kube_join_cmd.sh
+        content: "{{ slurped_join.content | b64decode }}"
+        mode: '0700'
+      when: "'not_joined' in node_status.stdout"
+
+    - name: Join the cluster
+      shell: /tmp/kube_join_cmd.sh
+      register: join_result
+      when: "'not_joined' in node_status.stdout"
+
+    - name: Display join result
+      debug:
+        var: join_result.stdout
+      when: "'not_joined' in node_status.stdout"
+
+- name: Verify cluster status
+  hosts: kube_master
+  become: yes
+  tasks:
+    - name: Wait for all nodes to be ready
+      shell: |
+        kubectl wait --for=condition=Ready nodes --all --timeout=600s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: wait_nodes
+      ignore_errors: yes
+
+    - name: Show all cluster nodes
+      shell: |
+        kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: nodes_output
+
+    - name: Print nodes
+      debug:
+        var: nodes_output.stdout
+
+    - name: Show all pods in kube-system
+      shell: |
+        kubectl get pods -n kube-system -o wide
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: kube_system_pods
+
+    - name: Print kube-system pods
+      debug:
+        var: kube_system_pods.stdout
+
+    - name: Show cluster info
+      shell: |
+        kubectl cluster-info
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: cluster_info
+
+    - name: Print cluster info
+      debug:
+        var: cluster_info.stdout

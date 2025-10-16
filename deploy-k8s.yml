@@ -1,19 +1,181 @@
 ---
-- name: Deploy hello app using kubectl on master
+- name: Deploy sample application to Kubernetes cluster
   hosts: kube_master
   become: yes
   tasks:
-    - name: Copy hello manifest to master
+    - name: Check if Kubernetes cluster is ready
+      shell: |
+        kubectl cluster-info --request-timeout=10s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: cluster_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display cluster status
+      debug:
+        var: cluster_check
+
+    - name: Wait for Kubernetes API to be available
+      shell: |
+        for i in {1..30}; do
+          if kubectl get nodes >/dev/null 2>&1; then
+            echo "Kubernetes API is ready"
+            exit 0
+          fi
+          echo "Waiting for Kubernetes API... attempt $i"
+          sleep 10
+        done
+        echo "Kubernetes API timeout"
+        exit 1
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: wait_api
+      when: cluster_check.rc != 0
+
+    - name: Restart kubelet if cluster is not ready
+      systemd:
+        name: kubelet
+        state: restarted
+      when: wait_api.rc != 0 and cluster_check.rc != 0
+
+    - name: Wait after kubelet restart
+      pause:
+        seconds: 30
+      when: wait_api.rc != 0 and cluster_check.rc != 0
+
+    - name: Final cluster check
+      shell: |
+        kubectl get nodes
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: final_check
+      ignore_errors: yes
+
+    - name: Display final cluster status
+      debug:
+        var: final_check
+
+    - name: Fail if cluster is not ready
+      fail:
+        msg: "Kubernetes cluster is not ready. Please check cluster status manually."
+      when: final_check.rc != 0
+
+    - name: Create namespace for our application
+      shell: |
+        kubectl create namespace hello-app || true
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+
+    - name: Create deployment manifest for hello app
       copy:
-        src: ./hello.yaml
-        dest: /tmp/hello.yaml
-        owner: "{{ ansible_user }}"
+        dest: /tmp/hello-deployment.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: hello-deployment
+            namespace: hello-app
+            labels:
+              app: hello
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: hello
+            template:
+              metadata:
+                labels:
+                  app: hello
+              spec:
+                containers:
+                - name: hello-container
+                  image: nginx:alpine
+                  ports:
+                  - containerPort: 80
         mode: '0644'
 
-    - name: Apply manifest with kubectl
-      shell: KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /tmp/hello.yaml
-      register: apply_output
+    - name: Create service manifest
+      copy:
+        dest: /tmp/hello-service.yaml
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: hello-service
+            namespace: hello-app
+          spec:
+            type: NodePort
+            selector:
+              app: hello
+            ports:
+            - port: 80
+              targetPort: 80
+              nodePort: 30007
+        mode: '0644'
 
-    - name: Show applied resources
+    - name: Apply deployment
+      shell: |
+        kubectl apply -f /tmp/hello-deployment.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: deploy_result
+
+    - name: Show deployment result
       debug:
-        var: apply_output.stdout_lines
+        var: deploy_result.stdout
+
+    - name: Apply service
+      shell: |
+        kubectl apply -f /tmp/hello-service.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: service_result
+
+    - name: Show service result
+      debug:
+        var: service_result.stdout
+
+    - name: Wait for pods to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=hello -n hello-app --timeout=120s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: wait_result
+      ignore_errors: yes
+
+    - name: Show application status
+      shell: |
+        echo "=== DEPLOYMENT ==="
+        kubectl get deployment -n hello-app -o wide
+        echo ""
+        echo "=== SERVICE ==="
+        kubectl get service -n hello-app -o wide
+        echo ""
+        echo "=== PODS ==="
+        kubectl get pods -n hello-app -o wide
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: app_status
+
+    - name: Display application status
+      debug:
+        var: app_status.stdout
+
+    - name: Get access information
+      shell: |
+        echo "=== APPLICATION ACCESS INFORMATION ==="
+        echo "NodePort URL: http://<NODE_IP>:30007"
+        echo ""
+        echo "Available Node IPs:"
+        kubectl get nodes -o wide | awk 'NR>1 {print "  http://" $6 ":30007"}'
+        echo ""
+        echo "Test command:"
+        echo "curl http://<ANY_NODE_IP>:30007"
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: access_info
+
+    - name: Display access information
+      debug:
+        var: access_info.stdout
